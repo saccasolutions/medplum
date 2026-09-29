@@ -1,0 +1,27 @@
+{
+  "name": "@practiceai/medplum-setup",
+  "version": "0.0.0",
+  "private": true,
+  "description": "PracticeAI RCM platform: local dev stack, project/role setup, and access-policy tooling for the Medplum fork",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev:up": "bash scripts/dev-up.sh",
+    "dev:down": "bash scripts/dev-down.sh",
+    "smoke": "tsx scripts/smoke.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@medplum/core": "5.1.42"
+  },
+  "devDependencies": {
+    "@medplum/fhirtypes": "5.1.42",
+    "tsx": "4.23.15",
+    "typescript": "6.0.3",
+    "vitest": "4.1.11"
+  },
+  "engines": {
+    "node": "^22.18.0 || >=24.2.0"
+  }
+}

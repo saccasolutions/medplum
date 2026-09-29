@@ -1,0 +1,225 @@
+# PracticeAI (fork-local) compose file. Kept separate from upstream docker-compose*.yml so the
+# fork rebases cleanly. SYNTHETIC DATA ONLY: no PHI until BAAs and the compliance checklist are
+# complete (billing docs/product-plan.txt §5). See packages/practiceai/README.md "Compose stack".
+#
+# Two modes:
+#
+# 1) Backing services only (default, no profile) for running the server from source:
+#      docker compose -f docker-compose.practiceai.yml up -d
+#      MEDPLUM_SKIP_LOCAL_SERVICES=1 bash packages/practiceai/scripts/dev-up.sh
+#
+# 2) Full stack (profile "stack"): Medplum server + Medplum app built from THIS fork with the
+#    upstream Dockerfiles, a one-shot provisioning job, and the billing app wired to Medplum:
+#      cp packages/practiceai/.env.example packages/practiceai/.env      # optional overrides
+#      bash packages/practiceai/scripts/docker-build.sh                 # builds the tarballs the
+#                                                                       # upstream Dockerfiles ADD
+#      docker compose --env-file packages/practiceai/.env -f docker-compose.practiceai.yml --profile stack up -d
+#    (--env-file is optional; every ${VAR:-default} below has a synthetic dev default.)
+#    Medplum API http://localhost:8103, Medplum app http://localhost:3000, billing http://localhost:3100
+#
+# Build inputs (the upstream Dockerfiles take no build args):
+#   medplum-server: context "." + ./Dockerfile; needs ./medplum-server-metadata.tar.gz and
+#                   ./medplum-server-runtime.tar.gz (scripts/docker-build.sh). Base images come from
+#                   dhi.io (Docker Hardened Images): run `docker login dhi.io` first.
+#   medplum-app:    context ./packages/app + its Dockerfile; needs packages/app/medplum-app.tar.gz
+#                   built with __MEDPLUM_BASE_URL__-style placeholders (scripts/docker-build.sh).
+#   practiceai-provision: node image with packages/practiceai/{scripts,src} (inline Dockerfile).
+#   billing:        context ${BILLING_DIR:-../billing} (the companion billing app repo), inline Dockerfile.
+#
+# Secrets: none are committed. Dev defaults below are the upstream dev values (Postgres/Redis
+# "medplum", seeded super admin admin@example.com / medplum_admin). The billing integration client
+# secret is created at runtime by the provisioning job and handed to the billing container through
+# the "practiceai-shared" volume (medplum-projects.env); it never touches the repo.
+name: practiceai-medplum
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=medplum
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-medplum}
+    volumes:
+      - ./postgres/postgres.conf:/usr/local/etc/postgres/postgres.conf:ro
+      - ./postgres/:/docker-entrypoint-initdb.d/:ro
+      - practiceai-postgres-data:/var/lib/postgresql/data
+    command: postgres -c config_file=/usr/local/etc/postgres/postgres.conf
+    ports:
+      - '${PRACTICEAI_PG_PORT:-5432}:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U medplum']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD:-medplum}
+    ports:
+      - '${PRACTICEAI_REDIS_PORT:-6379}:6379'
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-medplum}
+    healthcheck:
+      test: ['CMD-SHELL', 'redis-cli -a "$${REDIS_PASSWORD}" ping | grep -q PONG']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Medplum server built from this fork (upstream ./Dockerfile, unchanged).
+  medplum-server:
+    profiles: ['stack']
+    image: practiceai/medplum-server:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - '${PRACTICEAI_SERVER_PORT:-8103}:8103'
+    # "env": load the server config from MEDPLUM_* environment variables (packages/server/src/config).
+    command: ['env']
+    environment:
+      MEDPLUM_PORT: 8103
+      MEDPLUM_BASE_URL: ${MEDPLUM_PUBLIC_BASE_URL:-http://localhost:8103/}
+      MEDPLUM_APP_BASE_URL: ${MEDPLUM_APP_PUBLIC_BASE_URL:-http://localhost:3000/}
+      MEDPLUM_STORAGE_BASE_URL: ${MEDPLUM_PUBLIC_BASE_URL:-http://localhost:8103/}storage/
+      MEDPLUM_DATABASE_HOST: postgres
+      MEDPLUM_DATABASE_PORT: 5432
+      MEDPLUM_DATABASE_DBNAME: medplum
+      MEDPLUM_DATABASE_USERNAME: medplum
+      MEDPLUM_DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-medplum}
+      MEDPLUM_REDIS_HOST: redis
+      MEDPLUM_REDIS_PORT: 6379
+      MEDPLUM_REDIS_PASSWORD: ${REDIS_PASSWORD:-medplum}
+      MEDPLUM_BINARY_STORAGE: 'file:./binary/'
+      MEDPLUM_SUPPORT_EMAIL: '"PracticeAI dev" <support@synthetic-pt.example>'
+      MEDPLUM_ALLOWED_ORIGINS: ${MEDPLUM_ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:3100}
+      MEDPLUM_INTROSPECTION_ENABLED: 'true'
+      MEDPLUM_VM_CONTEXT_BOTS_ENABLED: 'true'
+      MEDPLUM_DEFAULT_BOT_RUNTIME_VERSION: 'vmcontext'
+      MEDPLUM_MAX_JSON_SIZE: '1mb'
+      MEDPLUM_MAX_BATCH_SIZE: '50mb'
+      MEDPLUM_SHUTDOWN_TIMEOUT_MILLISECONDS: 30000
+    volumes:
+      - practiceai-binary:/usr/src/medplum/binary
+    healthcheck:
+      # The hardened runtime image has no curl/wget; use Node's fetch.
+      test: ['CMD', 'node', '-e', 'fetch("http://localhost:8103/healthcheck").then(r=>r.json()).then(j=>process.exit(j.ok?0:1)).catch(()=>process.exit(1))']
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+
+  # Medplum admin web app built from this fork (upstream packages/app/Dockerfile, unchanged).
+  medplum-app:
+    profiles: ['stack']
+    image: practiceai/medplum-app:local
+    build:
+      context: ./packages/app
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      medplum-server:
+        condition: service_healthy
+    environment:
+      # Replaces the __PLACEHOLDER__ values baked into the build (packages/app/docker-entrypoint.sh).
+      MEDPLUM_BASE_URL: ${MEDPLUM_PUBLIC_BASE_URL:-http://localhost:8103/}
+      MEDPLUM_CLIENT_ID: ''
+      GOOGLE_CLIENT_ID: ''
+      RECAPTCHA_SITE_KEY: ''
+      MEDPLUM_REGISTER_ENABLED: 'false'
+      MEDPLUM_AWS_TEXTRACT_ENABLED: 'false'
+    ports:
+      - '${PRACTICEAI_APP_PORT:-3000}:3000'
+
+  # One-shot: create the super admin client, provision the synthetic PT practice (project, policies,
+  # integration client, provider, practice admin, PT content) and write MEDPLUM_PROJECTS for billing.
+  # Idempotent across restarts (state in the practiceai-run volume).
+  practiceai-provision:
+    profiles: ['stack']
+    image: practiceai/provision:local
+    build:
+      context: ./packages/practiceai/scripts
+      additional_contexts:
+        practiceai-src: ./packages/practiceai/src
+      dockerfile_inline: |
+        FROM node:22-slim
+        WORKDIR /opt/practiceai
+        RUN npm init -y >/dev/null && npm pkg set type=module \
+          && npm install --no-audit --no-fund @medplum/core@5.1.42 tsx@4.23.15
+        COPY --from=practiceai-src . ./src
+        COPY . ./scripts
+        ENTRYPOINT ["bash", "scripts/compose-provision.sh"]
+    depends_on:
+      medplum-server:
+        condition: service_healthy
+    restart: 'no'
+    environment:
+      MEDPLUM_BASE_URL: http://medplum-server:8103/
+      # baseUrl written into MEDPLUM_PROJECTS (what the billing container uses).
+      MEDPLUM_GATEWAY_BASE_URL: http://medplum-server:8103/
+      PRACTICEAI_ORG_ID: ${PRACTICEAI_ORG_ID:-d0000000-0000-4000-8000-00000000d001}
+      PRACTICEAI_PRACTICE_NAME: ${PRACTICEAI_PRACTICE_NAME:-Example Test PT Clinic}
+      MEDPLUM_ADMIN_EMAIL: ${MEDPLUM_ADMIN_EMAIL:-admin@example.com}
+      MEDPLUM_ADMIN_PASSWORD: ${MEDPLUM_ADMIN_PASSWORD:-medplum_admin}
+      PRACTICEAI_SHARED_DIR: /shared
+    volumes:
+      - practiceai-run:/opt/practiceai/.run
+      - practiceai-shared:/shared
+
+  # Companion billing/RCM app (Next.js), FHIR_MODE=medplum against the fork's server.
+  billing:
+    profiles: ['stack']
+    image: practiceai/billing:local
+    build:
+      context: ${BILLING_DIR:-../billing}
+      # Only the files next build needs are copied (the billing repo has no .dockerignore).
+      dockerfile_inline: |
+        FROM node:22-slim
+        WORKDIR /app
+        COPY package.json package-lock.json ./
+        RUN npm ci --no-audit --no-fund
+        COPY next.config.ts tsconfig.json next-env.d.ts ./
+        COPY src ./src
+        RUN npx next build
+        ENV NODE_ENV=production
+        EXPOSE 3100
+        CMD ["sh", "-c", "set -a; . /shared/medplum-projects.env; set +a; exec npx next start -H 0.0.0.0 -p 3100"]
+    depends_on:
+      practiceai-provision:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    environment:
+      APP_ENV: development
+      # The billing app refuses AUTH_MODE=demo together with FHIR_MODE=medplum (fail closed, billing
+      # src/lib/server/config.ts), and Supabase auth needs STORE_MODE=supabase. Supply a Supabase project
+      # (synthetic data only) through the host environment; without it the billing service refuses to start.
+      STORE_MODE: ${BILLING_STORE_MODE:-supabase}
+      AUTH_MODE: ${BILLING_AUTH_MODE:-supabase}
+      NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
+      FHIR_MODE: medplum
+      MEDPLUM_BASE_URL: http://medplum-server:8103/
+      # MEDPLUM_PROJECTS comes from /shared/medplum-projects.env (provisioning job).
+      # The in-app demo seed writes Practitioner/Location, which the integration policy keeps
+      # read-only, so it is off with FHIR_MODE=medplum (see packages/practiceai/README.md).
+      SEED_DEMO: 'false'
+      CLEARINGHOUSE_MODE: mock
+      AI_MODE: mock
+      DEMO_SESSION_SECRET: ${DEMO_SESSION_SECRET:-}
+    volumes:
+      - practiceai-shared:/shared:ro
+    ports:
+      - '${PRACTICEAI_BILLING_PORT:-3100}:3100'
+
+volumes:
+  practiceai-postgres-data:
+  practiceai-binary:
+  practiceai-run:
+  practiceai-shared:
