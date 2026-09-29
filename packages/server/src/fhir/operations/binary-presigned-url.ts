@@ -4,6 +4,7 @@ import { AccessPolicyInteraction, allOk, forbidden, OperationOutcomeError } from
 import type { FhirRequest, FhirResponse } from '@medplum/fhir-router';
 import type { Binary } from '@medplum/fhirtypes';
 import { getAuthenticatedContext } from '../../context';
+import { practiceAiGuardBinaryUpload } from '../../practiceai/guard'; // PRACTICEAI: signed-content guard
 import { getPresignedUrl } from '../../storage/loader';
 import { makeOperationDefinition } from './definitions';
 import { buildOutputParameters, parseInputParameters } from './utils/parameters';
@@ -34,6 +35,7 @@ export async function binaryPresignedUrlHandler(req: FhirRequest): Promise<FhirR
   if (params.upload && !repo.canPerformInteraction(AccessPolicyInteraction.UPDATE, resource)) {
     throw new OperationOutcomeError(forbidden);
   }
+  await practiceAiGuardBinaryUpload(repo, resource, params.upload); // PRACTICEAI: upload = overwrite (fork-local)
 
   const url = await getPresignedUrl(resource, params);
   return [allOk, buildOutputParameters(operation, { url })];

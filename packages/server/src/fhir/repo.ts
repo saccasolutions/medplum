@@ -71,6 +71,7 @@ import { AuthenticatedRequestContext, tryGetRequestContext } from '../context';
 import { DatabaseMode } from '../database';
 import { getLogger } from '../logger';
 import { incrementCounter, recordHistogramValue } from '../otel/otel';
+import { practiceAiGuardDelete, practiceAiGuardExpunge, practiceAiGuardWrite } from '../practiceai/guard'; // PRACTICEAI: signed-content guard
 import {
   cleanupUserSubs,
   getUserActiveWebSocketSubscriptionCount,
@@ -1078,6 +1079,7 @@ export class Repository extends FhirRepository implements Disposable {
       // Check after the update
       throw new OperationOutcomeError(forbidden);
     }
+    await practiceAiGuardWrite(this, existing, result); // PRACTICEAI: signed-content guard (fork-local)
 
     await this.handleStorage(result, create);
     await this.postCommit(async () => this.handleBinaryUpdate(existing, result));
@@ -1371,6 +1373,7 @@ export class Repository extends FhirRepository implements Disposable {
       if (!this.canPerformInteraction(AccessPolicyInteraction.DELETE, resource)) {
         throw new OperationOutcomeError(forbidden);
       }
+      await practiceAiGuardDelete(this, resource); // PRACTICEAI: signed-content guard (fork-local)
 
       await preCommitValidation(this, resource, 'delete');
 
@@ -1538,6 +1541,7 @@ export class Repository extends FhirRepository implements Disposable {
     if (!this.isSuperAdmin() && !this.isProjectAdmin()) {
       throw new OperationOutcomeError(forbidden);
     }
+    await practiceAiGuardExpunge(this, resourceType, ids); // PRACTICEAI: signed-content guard (fork-local)
     if (ids.length === 0) {
       return;
     }

@@ -8,6 +8,7 @@ import { body } from 'express-validator';
 import { getAuthenticatedContext } from '../context';
 import type { Repository } from '../fhir/repo';
 import { generateSecret } from '../oauth/keys';
+import { practiceAiGuardNewMembership } from '../practiceai/guard'; // PRACTICEAI: signed-content guard
 import { makeValidationMiddleware } from '../util/validator';
 
 export const createClientValidator = makeValidationMiddleware([
@@ -39,6 +40,7 @@ export interface CreateClientRequest extends Partial<ClientApplication> {
 export async function createClient(repo: Repository, request: CreateClientRequest): Promise<WithId<ClientApplication>> {
   const { project, accessPolicy, meta, ...rest } = request;
 
+  await practiceAiGuardNewMembership(repo, project.id, { accessPolicy }); // PRACTICEAI: policy required (fork-local)
   const systemRepo = repo.getSystemRepo();
   const client = await systemRepo.createResource<ClientApplication>({
     ...rest,

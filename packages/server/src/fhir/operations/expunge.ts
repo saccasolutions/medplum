@@ -16,6 +16,7 @@ import type { FhirRequest, FhirResponse } from '@medplum/fhir-router';
 import type { ResourceType } from '@medplum/fhirtypes';
 import { getConfig } from '../../config/loader';
 import { getAuthenticatedContext } from '../../context';
+import { practiceAiGuardExpunge } from '../../practiceai/guard'; // PRACTICEAI: signed-content guard
 import type { Repository } from '../repo';
 import { AsyncJobExecutor } from './utils/asyncjobexecutor';
 import { buildBinaryIds } from './utils/binary';
@@ -38,6 +39,7 @@ export async function expungeHandler(req: FhirRequest): Promise<FhirResponse> {
     throw new OperationOutcomeError(badRequest('Invalid resource type'), { cause: resourceType });
   }
   const { everything } = req.query;
+  await practiceAiGuardExpunge(ctx.repo, resourceType, [id]); // PRACTICEAI: 403 before the async job (fork-local)
   if (resourceType === 'Project' || everything === 'true') {
     // Only super admins can expunge a project other than the current project.
     // For non-Project resources, the project-scoped repo restricts the compartment

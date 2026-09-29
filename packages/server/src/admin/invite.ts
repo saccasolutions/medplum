@@ -39,6 +39,7 @@ import { getProjectSystemRepo } from '../fhir/repo';
 import { sendFhirResponse } from '../fhir/response';
 import { getLogger } from '../logger';
 import { generateSecret } from '../oauth/keys';
+import { practiceAiGuardNewMembership } from '../practiceai/guard'; // PRACTICEAI: signed-content guard
 import { makeValidationMiddleware } from '../util/validator';
 
 export const inviteValidator = makeValidationMiddleware([
@@ -450,6 +451,7 @@ async function upsertProjectMembership(
     }
   }
 
+  await practiceAiGuardNewMembership(undefined, project.id, partialMembership); // PRACTICEAI: fork-local
   if (request.forceNewMembership) {
     return createProjectMembership(systemRepo, user, project, profile, partialMembership);
   }

@@ -5,6 +5,7 @@ import type { WithId } from '@medplum/core';
 import { ClientStorage, MedplumClient, MemoryStorage } from '@medplum/core';
 import type { Resource } from '@medplum/fhirtypes';
 import { createHash, randomBytes } from 'node:crypto';
+import { SIGNED_LOCK_OUTCOME_SYSTEM } from '../../src/policies/constants';
 
 export const BASE_URL = (process.env.MEDPLUM_BASE_URL ?? '').replace(/\/?$/, '/');
 export const LIVE = Boolean(process.env.MEDPLUM_BASE_URL);
@@ -151,4 +152,19 @@ export function expectAllowed(r: HttpResult, what: string): void {
  */
 export function expectForbidden(r: HttpResult, what: string): void {
   expectStatus(r, 403, what);
+}
+
+/**
+ * Denied by the fork's server-side signed-content guard (packages/server/src/practiceai/guard.ts): 403 whose
+ * OperationOutcome carries the guard's reason code.
+ * @param r - The HTTP result.
+ * @param reason - Expected reason code (SIGNED_LOCK_REASONS value).
+ * @param what - Description of the operation, used in the failure message.
+ */
+export function expectLockDenied(r: HttpResult, reason: string, what: string): void {
+  expectStatus(r, 403, what);
+  const coding = r.body?.issue?.[0]?.details?.coding?.[0];
+  if (coding?.system !== SIGNED_LOCK_OUTCOME_SYSTEM || coding?.code !== reason) {
+    throw new Error(`${what}: expected guard reason ${reason}, got ${JSON.stringify(r.body?.issue?.[0])}`);
+  }
 }

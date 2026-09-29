@@ -6,7 +6,7 @@
  */
 import type { Project, ProjectMembership } from '@medplum/fhirtypes';
 import { describe, expect, test } from 'vitest';
-import { REQUIRED_PROJECT_FEATURES } from '../../src/policies';
+import { REQUIRED_PROJECT_FEATURES, SIGNED_LOCK_PROJECT_SETTING } from '../../src/policies';
 import { INTEGRATION_CLIENT_NAME, npiWithCheckDigit, provisionPractice } from '../../src/provisioning';
 import type { ProvisionPracticeInput } from '../../src/provisioning';
 import type { AdminClient } from '../../src/provisioning/types';
@@ -117,5 +117,25 @@ describe('provisioning survives a crash at every write', () => {
     const r = await provisionPractice(fake.client(), INPUT);
     expect(r.actions.find((a) => a.step === 'project')?.status).toBe('updated');
     expect((fake.all('Project')[0] as Project).features).toEqual(['bots', ...REQUIRED_PROJECT_FEATURES]);
+  });
+
+  test('an existing project without (or with a cleared) signed-lock flag is repaired; other settings kept', async () => {
+    const fake = new FakeAdmin();
+    await provisionPractice(fake.client(), INPUT);
+    const project = fake.all('Project')[0] as Project & { id: string };
+    expect(project.systemSetting).toEqual([{ name: SIGNED_LOCK_PROJECT_SETTING, valueBoolean: true }]);
+    const other = { name: 'rateLimit', valueInteger: 100 };
+    for (const systemSetting of [undefined, [other], [other, { name: SIGNED_LOCK_PROJECT_SETTING, valueBoolean: false }]]) {
+      fake.store.set(`Project/${project.id}`, { ...project, systemSetting } as never);
+      const r = await provisionPractice(fake.client(), INPUT);
+      expect(r.actions.find((a) => a.step === 'project')?.status).toBe('updated');
+      const repaired = (fake.all('Project')[0] as Project).systemSetting;
+      expect(repaired).toContainEqual({ name: SIGNED_LOCK_PROJECT_SETTING, valueBoolean: true });
+      if (systemSetting) {
+        expect(repaired).toContainEqual(other);
+      }
+      const again = await provisionPractice(fake.client(), INPUT);
+      expect(again.actions.find((a) => a.step === 'project')?.status).toBe('unchanged');
+    }
   });
 });

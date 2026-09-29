@@ -332,6 +332,22 @@ describe.skipIf(!LIVE)('provisioning (live server)', () => {
       expect(related.map((d) => d.id).sort()).toEqual([noteDoc.id, addendum.id].sort());
       const noteNow = await clientA.readResource('DocumentReference', noteDoc.id as string);
       expect(noteNow.meta?.versionId).toBe(noteDoc.meta?.versionId);
+
+      // Server guard (Project.systemSetting practiceai-signed-lock, set by provisioning): the encounter's
+      // Procedure/Condition (not labelled by this sign transaction) are locked, and nothing new can be attached.
+      expect(await statusOf(clientA.updateResource<Procedure>({ ...procedure, status: 'entered-in-error' }))).toBe(403);
+      expect(await statusOf(clientA.updateResource<Condition>({ ...condition, recordedDate: '2026-09-29' }))).toBe(403);
+      expect(
+        await statusOf(
+          clientA.createResource<Procedure>({
+            resourceType: 'Procedure',
+            status: 'completed',
+            code: { coding: [{ system: SYSTEMS.cpt, code: '97140' }] },
+            subject: { reference: `Patient/${patient.id}` },
+            encounter: { reference: `Encounter/${encounter.id}` },
+          }),
+        ),
+      ).toBe(403);
     });
 
     test('Claim and ClaimResponse create/update', async () => {

@@ -35,6 +35,33 @@ export const SIGNED_LOCK_SECURITY = {
   display: 'Signed clinical content (immutable)',
 } as const;
 
+/**
+ * Project.systemSetting that enables the server-side signed-content guard of this fork
+ * (packages/server/src/practiceai/guard.ts). systemSetting is writable only by a super admin, so a
+ * project admin cannot turn the guard off. Provisioning sets it on every practice project.
+ */
+export const SIGNED_LOCK_PROJECT_SETTING = 'practiceai-signed-lock';
+
+/** CodeSystem of `issue[0].details.coding` in the server guard's 403 OperationOutcomes. */
+export const SIGNED_LOCK_OUTCOME_SYSTEM = `${PLATFORM_FHIR_BASE}/CodeSystem/signed-lock-outcome`;
+
+/** Reason codes of the server guard (packages/server/src/practiceai/guard.ts LockReason). */
+export const SIGNED_LOCK_REASONS = {
+  signedContent: 'signed-content-locked',
+  signedEncounter: 'encounter-signed',
+  expunge: 'expunge-forbidden',
+  membershipPolicyRequired: 'membership-policy-required',
+  membershipPolicyForeign: 'membership-policy-foreign',
+  membershipAdmin: 'membership-admin-forbidden',
+  projectSettings: 'project-settings-locked',
+  accessPolicyAdmin: 'access-policy-super-admin-only',
+  auditImmutable: 'audit-immutable',
+  /** Encounter link of a clinical child is not a literal `Encounter/<id>` (identifier-only, contained, ...). */
+  encounterReferenceInvalid: 'encounter-reference-invalid',
+  /** Binaries are write-once in a locked project (signed notes point at `Binary/<id>` without a version). */
+  binaryImmutable: 'binary-immutable',
+} as const;
+
 /** Identifier system used to find/upsert the PracticeAI AccessPolicies inside a project. */
 export const ACCESS_POLICY_IDENTIFIER_SYSTEM = `${PLATFORM_FHIR_BASE}/sid/access-policy`;
 

@@ -11,7 +11,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { beforeAll, describe, expect, test } from 'vitest';
 import { PROVISIONING_SYSTEMS } from '../../src/content';
-import { REQUIRED_PROJECT_FEATURES } from '../../src/policies';
+import { REQUIRED_PROJECT_FEATURES, SIGNED_LOCK_PROJECT_SETTING } from '../../src/policies';
 import { npiWithCheckDigit, provisionPractice, toMedplumProjects } from '../../src/provisioning';
 import type { ProvisionPracticeInput, ProvisionResult } from '../../src/provisioning';
 import { LIVE, clientLogin, statusOf, superAdminClient } from './live-helpers';
@@ -98,6 +98,22 @@ describe.skipIf(!LIVE)('provisioning crash safety (live server)', () => {
     const again = await provisionPractice(admin, input);
     expect(again.actions.find((a) => a.step === 'project')?.status).toBe('updated');
     expect((await admin.readResource<Project>('Project', r.projectId as string)).features).toEqual([...REQUIRED_PROJECT_FEATURES]);
+  });
+
+  test('a provisioned project has the server-side signed-content lock flag; a cleared flag is repaired', async () => {
+    const input = practice('lockflag');
+    const r = await provisionPractice(admin, input);
+    const project = await admin.readResource<Project>('Project', r.projectId as string);
+    expect(project.systemSetting).toContainEqual({ name: SIGNED_LOCK_PROJECT_SETTING, valueBoolean: true });
+    // drift repair: a super admin clearing the flag (audited as break-glass by the server) is undone by the next run
+    await admin.updateResource<Project>({ ...project, systemSetting: [{ name: SIGNED_LOCK_PROJECT_SETTING, valueBoolean: false }] });
+    const again = await provisionPractice(admin, input);
+    expect(again.actions.find((a) => a.step === 'project')?.status).toBe('updated');
+    expect((await admin.readResource<Project>('Project', r.projectId as string)).systemSetting).toEqual([
+      { name: SIGNED_LOCK_PROJECT_SETTING, valueBoolean: true },
+    ]);
+    const third = await provisionPractice(admin, input);
+    expect(third.actions.find((a) => a.step === 'project')?.status).toBe('unchanged');
   });
 
   test('crash at every write #N, then rerun: converges to the same resources with no duplicates; a third run is a no-op', async () => {

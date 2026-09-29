@@ -6,7 +6,7 @@ import type { MedplumClient } from '@medplum/core';
 import { createReference } from '@medplum/core';
 import type { AccessPolicy, ClientApplication, Project, ProjectMembership } from '@medplum/fhirtypes';
 import type { PracticeRole } from './constants';
-import { PRACTICE_ROLES } from './constants';
+import { PRACTICE_ROLES, SIGNED_LOCK_PROJECT_SETTING } from './constants';
 import type { PracticePolicyOptions } from './roles';
 import { buildRolePolicy } from './roles';
 
@@ -52,6 +52,36 @@ export async function upsertPracticePolicies(
 export const REQUIRED_PROJECT_FEATURES: NonNullable<Project['features']> = ['transaction-bundles'];
 
 /**
+ * Project system settings every practice project needs (super admin only; project admins cannot change
+ * systemSetting). `practiceai-signed-lock` turns on the fork's server-side signed-content guard
+ * (packages/server/src/practiceai/guard.ts): it refuses, for every identity except the super admin, edits and
+ * deletes of signed content and of the children of a signed encounter, new children on a signed encounter
+ * (except addenda), $expunge, and the project-admin policy bypasses.
+ */
+export const REQUIRED_PROJECT_SYSTEM_SETTINGS: NonNullable<Project['systemSetting']> = [
+  { name: SIGNED_LOCK_PROJECT_SETTING, valueBoolean: true },
+];
+
+/**
+ * Existing project system settings with the required ones enforced (other settings and order kept; a required
+ * setting with a different value is replaced in place).
+ * @param existing - The project's current systemSetting.
+ * @returns The merged systemSetting.
+ */
+export function mergeSystemSettings(existing: Project['systemSetting']): NonNullable<Project['systemSetting']> {
+  const out = [...(existing ?? [])];
+  for (const required of REQUIRED_PROJECT_SYSTEM_SETTINGS) {
+    const i = out.findIndex((s) => s.name === required.name);
+    if (i === -1) {
+      out.push({ ...required });
+    } else if (JSON.stringify(out[i]) !== JSON.stringify(required)) {
+      out[i] = { ...required };
+    }
+  }
+  return out;
+}
+
+/**
  * Creates a practice project (super admin only).
  * @param medplum - A MedplumClient authenticated as a super admin (operations identity).
  * @param name - Display name.
@@ -62,6 +92,7 @@ export async function createPracticeProject(medplum: MedplumClient, name: string
     resourceType: 'Project',
     name,
     features: [...REQUIRED_PROJECT_FEATURES],
+    systemSetting: mergeSystemSettings(undefined),
     // Keep history (default) — signed-note reconstruction depends on _history.
   });
   return project;

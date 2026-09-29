@@ -7,11 +7,11 @@
 // Run: MEDPLUM_BASE_URL=http://localhost:8103 npx vitest run --config test/policies/vitest.live.config.ts
 
 import type { Encounter } from '@medplum/fhirtypes';
-import { LOINC_PROGRESS_NOTE, LOINC_SYSTEM } from '../../src/policies';
+import { LOINC_PROGRESS_NOTE, LOINC_SYSTEM, SIGNED_LOCK_REASONS } from '../../src/policies';
 import type { Fixture, SignedNote } from './fixture';
 import { addendum, setupFixture, signNote, strip, writeDraftNote } from './fixture';
 import type { Actor, HttpResult } from './harness';
-import { BASE_URL, LIVE, describe_, expectAllowed, expectForbidden, expectStatus } from './harness';
+import { BASE_URL, LIVE, describe_, expectAllowed, expectForbidden, expectLockDenied, expectStatus } from './harness';
 
 function isSuccess(r: HttpResult): boolean {
   return r.status >= 200 && r.status < 300;
@@ -214,8 +214,20 @@ describe.skipIf(!LIVE)('Adversarial: signed-encounter lock and role limits (live
       const noStatus = await a.create(addendum(signed, pract, { docStatus: undefined }));
       expectForbidden(noStatus, `${name} addendum without docStatus`);
     }
-    // an existing preliminary document cannot be turned into an addendum later either
-    const draft = await integration.create({ ...addendum(signed, pract), docStatus: 'preliminary', relatesTo: undefined });
+    // a new preliminary document on the signed encounter is refused by the server guard (new child of a signed
+    // encounter that is not an addendum)
+    expectLockDenied(
+      await integration.create({ ...addendum(signed, pract), docStatus: 'preliminary', relatesTo: undefined }),
+      SIGNED_LOCK_REASONS.signedEncounter,
+      'preliminary document on the signed encounter'
+    );
+    // an existing preliminary document (not linked to the encounter) cannot be turned into an addendum later either
+    const draft = await integration.create({
+      ...addendum(signed, pract),
+      docStatus: 'preliminary',
+      relatesTo: undefined,
+      context: undefined,
+    });
     expectAllowed(draft, 'preliminary unrelated document');
     expectForbidden(
       await integration.update({ ...draft.body, relatesTo: addendum(signed, pract).relatesTo }),
@@ -293,13 +305,12 @@ describe.skipIf(!LIVE)('Adversarial: signed-encounter lock and role limits (live
 
   // ------------------------------------------------------------------ known gaps (documented, not fixable by policy)
 
-  test('KNOWN GAP: NEW child resources can still be attached to a signed encounter by provider / integration', async () => {
-    // AccessPolicy writeConstraints are evaluated on the written resource only; FHIRPath cannot dereference
-    // Procedure.encounter to see that the Encounter is finished. So a new Procedure / Condition / completed
-    // QuestionnaireResponse / competing final progress note that points at the signed encounter is accepted.
-    // The billing app's getBillingContext loads children by `encounter=` search and bills them without
-    // re-verifying the signed content hash (billing patch docs/medplum/patches/0003). Server-side fix proposal:
-    // README "Known gaps" (reference-aware write constraint or pre-commit guard).
+  test('CLOSED (server guard): NEW child resources cannot be attached to a signed encounter (former gap 1)', async () => {
+    // AccessPolicy writeConstraints cannot dereference Procedure.encounter, but the fork's server guard
+    // (packages/server/src/practiceai/guard.ts) resolves the referenced Encounter server-side and refuses any new
+    // Condition / Procedure / Observation / ClinicalImpression / QuestionnaireResponse / DocumentReference /
+    // Composition on a finished encounter, except an addendum (final DocumentReference that `appends` a signed
+    // note of the same encounter, with author and date).
     const { integration, provider } = fx.a.actors;
     const encRef = { reference: `Encounter/${signed.encounter.id}` };
     for (const [name, a] of [
@@ -314,16 +325,38 @@ describe.skipIf(!LIVE)('Adversarial: signed-encounter lock and role limits (live
         encounter: encRef,
         performer: [{ actor: { reference: pract } }],
       } as any);
-      expectStatus(proc, 201, `${name} new Procedure on signed encounter (gap)`);
+      expectLockDenied(proc, SIGNED_LOCK_REASONS.signedEncounter, `${name} new Procedure on signed encounter`);
+      const cond = await a.create({
+        resourceType: 'Condition',
+        code: { coding: [{ system: 'http://hl7.org/fhir/sid/icd-10-cm', code: 'M25.561' }] },
+        subject: { reference: patientRef },
+        encounter: encRef,
+      } as any);
+      expectLockDenied(cond, SIGNED_LOCK_REASONS.signedEncounter, `${name} new Condition on signed encounter`);
+      const qr = await a.create({
+        resourceType: 'QuestionnaireResponse',
+        status: 'completed',
+        subject: { reference: patientRef },
+        encounter: encRef,
+        author: { reference: pract },
+      } as any);
+      expectLockDenied(qr, SIGNED_LOCK_REASONS.signedEncounter, `${name} new completed QR on signed encounter`);
       const note = await a.create({
         ...addendum(signed, pract),
         relatesTo: undefined,
         type: { coding: [{ system: LOINC_SYSTEM, code: LOINC_PROGRESS_NOTE }] },
       });
-      expectStatus(note, 201, `${name} competing final progress note (gap)`);
-      // ...but whatever was added is itself immutable from birth when final:
-      expectForbidden(await a.update({ ...note.body, description: 'x' }), `${name} competing note is locked`);
+      expectLockDenied(note, SIGNED_LOCK_REASONS.signedEncounter, `${name} competing final progress note`);
+      // the batch/transaction path is guarded too
+      const tx = await a.transaction([
+        { request: { method: 'POST', url: 'Procedure' }, resource: { resourceType: 'Procedure', status: 'completed', code: { text: 'x' }, subject: { reference: patientRef }, encounter: encRef, performer: [{ actor: { reference: pract } }] } },
+      ]);
+      expectForbidden(tx, `${name} transaction POST Procedure on signed encounter`);
+      // a real addendum is still allowed (AI-03)
+      expectAllowed(await a.create(addendum(signed, pract)), `${name} addendum still allowed`);
     }
+    const children = await integration.get(`Procedure?encounter=Encounter/${signed.encounter.id}`);
+    expect((children.body.entry ?? []).map((e: any) => e.resource.id)).toEqual([signed.procedure.id]);
     // Biller, front office, practice admin and the AI service cannot do this (no clinical create).
     for (const role of ['biller', 'rcm_supervisor', 'front_office', 'practice_admin', 'ai_service'] as const) {
       const r = await fx.a.actors[role].create({
@@ -335,6 +368,72 @@ describe.skipIf(!LIVE)('Adversarial: signed-encounter lock and role limits (live
       } as any);
       expectForbidden(r, `${role} new Procedure on signed encounter`);
     }
+  });
+
+  test('CLOSED (server guard): logical (identifier) / other-element encounter references cannot attach to a signed encounter', async () => {
+    // Former bypasses: the guard only read the literal `encounter.reference`, so an identifier-only (logical)
+    // reference, or an Encounter reference in another element (Observation.focus), created new children on a
+    // signed encounter (201). The guard now resolves identifiers within the project, scans every element for
+    // Encounter references, and requires encounter links to be literal.
+    const { integration, provider } = fx.a.actors;
+    const identifier = { system: 'https://practiceai.example/fhir/sid/encounter', value: `ENC-REPRO-${fx.a.run}` };
+    const draft = await writeDraftNote(integration, patientRef, pract);
+    const withId = await integration.update<Encounter>({ ...draft.encounter, identifier: [identifier] });
+    expectAllowed(withId, 'integration adds business identifier to draft encounter');
+    const s = await signNote(integration, { ...draft, encounter: withId.body }, pract);
+    const logical = { type: 'Encounter' as const, identifier };
+    for (const [name, a] of [
+      ['integration', integration],
+      ['provider', provider],
+    ] as const) {
+      expectLockDenied(
+        await a.create({ resourceType: 'Observation', status: 'final', code: { text: 'ROM' }, subject: { reference: patientRef }, encounter: logical } as any),
+        SIGNED_LOCK_REASONS.signedEncounter,
+        `${name} Observation with encounter.identifier`
+      );
+      expectLockDenied(
+        await a.create({ resourceType: 'Observation', status: 'final', code: { text: 'ROM' }, subject: { reference: patientRef }, focus: [{ reference: `Encounter/${s.encounter.id}` }] } as any),
+        SIGNED_LOCK_REASONS.signedEncounter,
+        `${name} Observation with focus -> signed Encounter`
+      );
+    }
+    expectLockDenied(
+      await integration.create({ resourceType: 'Procedure', status: 'completed', code: { text: 'post-sign injected' }, subject: { reference: patientRef }, encounter: logical } as any),
+      SIGNED_LOCK_REASONS.signedEncounter,
+      'integration Procedure with encounter.identifier'
+    );
+    expectLockDenied(
+      await integration.create({
+        resourceType: 'DocumentReference',
+        status: 'current',
+        docStatus: 'preliminary',
+        type: { text: 'shadow note' },
+        subject: { reference: patientRef },
+        context: { encounter: [logical] },
+        content: [{ attachment: { contentType: 'text/plain', data: Buffer.from('shadow content').toString('base64') } }],
+      } as any),
+      SIGNED_LOCK_REASONS.signedEncounter,
+      'integration non-addendum DocumentReference with context.encounter.identifier'
+    );
+    expectLockDenied(
+      await integration.create({ resourceType: 'Procedure', status: 'completed', code: { text: 'x' }, subject: { reference: patientRef }, encounter: { identifier: { value: `NO-SUCH-${fx.a.run}` } } } as any),
+      SIGNED_LOCK_REASONS.encounterReferenceInvalid,
+      'integration Procedure with unresolvable identifier-only encounter'
+    );
+    const tx = await integration.transaction([
+      { request: { method: 'POST', url: 'Procedure' }, resource: { resourceType: 'Procedure', status: 'completed', code: { text: 'x' }, subject: { reference: patientRef }, encounter: logical } },
+    ]);
+    expectForbidden(tx, 'transaction POST Procedure with encounter.identifier');
+    // nothing was attached, by literal or logical link
+    const byIdent = await integration.get(`Procedure?encounter:identifier=${identifier.system}|${identifier.value}`);
+    expectStatus(byIdent, 200, 'search Procedure by encounter identifier');
+    expect(byIdent.body.entry ?? []).toHaveLength(0);
+    const docs = await integration.get(`DocumentReference?subject=${patientRef}&_count=200`);
+    expectStatus(docs, 200, 'search patient documents');
+    const shadow = (docs.body.entry ?? []).filter((e: any) => e.resource.type?.text === 'shadow note');
+    expect(shadow, 'no shadow note in the chart').toHaveLength(0);
+    // the real addendum still works
+    expectAllowed(await integration.create(addendum(s, pract)), 'addendum still allowed');
   });
 
   test('KNOWN GAP: any authenticated identity can call Project/$init (outside AccessPolicy)', async () => {

@@ -259,13 +259,14 @@ export interface SignedNote extends NoteSet {
  * @param practitionerRef - Reference string of the treating/signing Practitioner.
  * @param options - Optional settings.
  * @param options.lockChildren - Also stamp the signed-content lock label on the Condition/Procedure.
+ * @param options.noteContentUrl - Store the note body by reference (e.g. `Binary/<id>`) instead of inline data.
  * @returns The result of signNote.
  */
 export async function signNote(
   actor: Actor,
   set: NoteSet,
   practitionerRef: string,
-  options: { lockChildren?: boolean } = {}
+  options: { lockChildren?: boolean; noteContentUrl?: string } = {}
 ): Promise<SignedNote> {
   const signedAt = '2026-09-01T10:00:00.000Z';
   const noteUrn = 'urn:uuid:' + crypto.randomUUID();
@@ -312,7 +313,9 @@ export async function signNote(
           {
             attachment: {
               contentType: 'text/plain',
-              data: Buffer.from('Synthetic signed PT note').toString('base64'),
+              ...(options.noteContentUrl
+                ? { url: options.noteContentUrl }
+                : { data: Buffer.from('Synthetic signed PT note').toString('base64') }),
               title: 'Signed PT note',
               creation: signedAt,
             },

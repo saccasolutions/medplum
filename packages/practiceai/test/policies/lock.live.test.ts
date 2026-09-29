@@ -3,11 +3,11 @@
 
 import type { DocumentReference, Encounter } from '@medplum/fhirtypes';
 import type { PracticeRole } from '../../src/policies';
-import { SIGNED_LOCK_SECURITY } from '../../src/policies';
+import { SIGNED_LOCK_REASONS, SIGNED_LOCK_SECURITY } from '../../src/policies';
 import type { Fixture, SignedNote } from './fixture';
 import { addendum, draftEncounter, setupFixture, signNote, strip, writeDraftNote } from './fixture';
 import type { Actor } from './harness';
-import { LIVE, expectAllowed, expectForbidden, expectStatus } from './harness';
+import { LIVE, expectAllowed, expectForbidden, expectLockDenied, expectStatus } from './harness';
 
 describe.skipIf(!LIVE)('Signed-encounter lock (live server)', () => {
   let fx: Fixture;
@@ -278,11 +278,12 @@ describe.skipIf(!LIVE)('Signed-encounter lock (live server)', () => {
     expectForbidden(await integration.delete(`Binary/${bin.body.id}`), 'delete Binary');
   });
 
-  test('KNOWN GAP: without the lock label, Condition/Procedure of an app-signed encounter are still writable', async () => {
-    // The app's current signEncounter transaction does not touch Condition/Procedure. AccessPolicy
-    // criteria/writeConstraints cannot dereference Procedure.encounter, so the server cannot know the
-    // encounter is finished. The Encounter / QR / note themselves ARE locked.
-    const { integration } = fx.a.actors;
+  test('CLOSED (server guard): without the lock label, Condition/Procedure of an app-signed encounter are locked', async () => {
+    // The app's current signEncounter transaction does not touch Condition/Procedure, and AccessPolicy
+    // writeConstraints cannot dereference Procedure.encounter. The fork's server guard
+    // (packages/server/src/practiceai/guard.ts, enabled by Project.systemSetting practiceai-signed-lock) resolves
+    // the encounter server-side and refuses edits/deletes of every child of a finished encounter, labelled or not.
+    const { integration, provider } = fx.a.actors;
     expectForbidden(
       await integration.update({ ...unlabelled.encounter, status: 'in-progress' }),
       'unlabelled: Encounter still locked'
@@ -291,9 +292,23 @@ describe.skipIf(!LIVE)('Signed-encounter lock (live server)', () => {
       await integration.update({ ...unlabelled.noteDocument, description: 'x' }),
       'unlabelled: note still locked'
     );
-    const r = await integration.patch(`Procedure/${unlabelled.procedure.id}`, [
-      { op: 'replace', path: '/code/coding/0/code', value: '97140' },
-    ]);
-    expectStatus(r, 200, 'unlabelled Procedure is writable (gap documented in README)');
+    for (const [name, a] of [
+      ['integration', integration],
+      ['provider', provider],
+    ] as const) {
+      const r = await a.patch(`Procedure/${unlabelled.procedure.id}`, [
+        { op: 'replace', path: '/code/coding/0/code', value: '97140' },
+      ]);
+      expectLockDenied(r, SIGNED_LOCK_REASONS.signedEncounter, `${name}: unlabelled Procedure is locked`);
+      expectLockDenied(
+        await a.update({ ...unlabelled.condition, recordedDate: '2026-09-02' }),
+        SIGNED_LOCK_REASONS.signedEncounter,
+        `${name}: unlabelled Condition is locked`
+      );
+    }
+    // DELETE is already refused by the policies (no role has delete on clinical types).
+    expectForbidden(await integration.delete(`Condition/${unlabelled.condition.id}`), 'unlabelled Condition cannot be deleted');
+    const stored = await fx.superAdmin.get(`Procedure/${unlabelled.procedure.id}`);
+    expect(stored.body.meta.versionId).toBe(unlabelled.procedure.meta?.versionId);
   });
 });

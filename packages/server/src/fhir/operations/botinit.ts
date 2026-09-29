@@ -17,6 +17,7 @@ import { getConfig } from '../../config/loader';
 import { getAuthenticatedContext } from '../../context';
 import type { Repository } from '../../fhir/repo';
 import { getGlobalSystemRepo } from '../../fhir/repo';
+import { practiceAiGuardNewMembership } from '../../practiceai/guard'; // PRACTICEAI: signed-content guard
 import { getBinaryStorage } from '../../storage/loader';
 import { makeOperationDefinition } from './definitions';
 import { deployBot } from './deploy';
@@ -93,6 +94,7 @@ export async function createBot(
   project: WithId<Project>,
   params: BotInitParameters
 ): Promise<WithId<Bot>> {
+  await practiceAiGuardNewMembership(repo, project.id, { accessPolicy: params.accessPolicy }); // PRACTICEAI: fork-local
   let sourceCode: Attachment | undefined;
   if (params.sourceCode) {
     sourceCode = await createCodeBinary(repo, params.sourceCode);

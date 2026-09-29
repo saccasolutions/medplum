@@ -35,7 +35,7 @@ import type {
 import { randomBytes } from 'node:crypto';
 import { ptContentResources } from '../content';
 import { EXT, PROVISIONING_SYSTEMS, SYSTEMS } from '../content/constants';
-import { REQUIRED_PROJECT_FEATURES, buildPracticePolicies } from '../policies';
+import { REQUIRED_PROJECT_FEATURES, buildPracticePolicies, mergeSystemSettings } from '../policies';
 import { OneTimeSecret } from './secret';
 import type {
   AdminClient,
@@ -119,6 +119,8 @@ export function buildProject(input: ProvisionPracticeInput): Project {
     // 'transaction-bundles': without it Medplum runs `transaction` Bundles with batch semantics, so the
     // billing app's sign / autosave transactions would partially commit when one entry is refused.
     features: [...REQUIRED_PROJECT_FEATURES],
+    // 'practiceai-signed-lock': server-side signed-content guard (only a super admin can set/clear it).
+    systemSetting: mergeSystemSettings(undefined),
   };
 }
 
@@ -288,11 +290,12 @@ export async function provisionPractice(
   // 1. Project (one per practice).
   const existingProject = await p.findOne<Project>('project', 'Project', { identifier: orgKey });
   const projectDesired = buildProject(input);
-  const project = await p.converge<Project>('project', existingProject, projectDesired, ['name', 'identifier', 'features'], (e) => ({
+  const project = await p.converge<Project>('project', existingProject, projectDesired, ['name', 'identifier', 'features', 'systemSetting'], (e) => ({
     ...e,
     name: projectDesired.name,
     identifier: mergeIdentifiers(e.identifier, projectDesired.identifier ?? []),
     features: mergeFeatures(e.features),
+    systemSetting: mergeSystemSettings(e.systemSetting),
   }));
   if (!project) {
     // Dry run of a brand-new practice: everything downstream would be created.

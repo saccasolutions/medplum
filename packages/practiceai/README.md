@@ -5,8 +5,9 @@ into the clinical/FHIR platform of the **Independent PracticeAI RCM Platform**. 
 billing/RCM app lives in a separate repo (`/home/user/billing`, Next.js); it reaches this server
 through its `MedplumFhirGateway` (`src/lib/fhir/medplum-gateway.ts`).
 
-Everything PracticeAI-specific lives in this package plus `docker-compose.practiceai.yml` at the repo
-root, so upstream merges stay clean (see [Fork maintenance](#fork-maintenance)). Nothing is rebranded yet.
+Everything PracticeAI-specific lives in this package, `docker-compose.practiceai.yml` at the repo root, and
+the server guard in `packages/server/src/practiceai/` (new files) wired in by 14 one-line imports and hook calls marked
+`// PRACTICEAI:`, so upstream merges stay clean (see [Fork maintenance](#fork-maintenance)). Nothing is rebranded yet.
 
 > **HIPAA: synthetic data only.** No PHI may enter any environment built from this package until
 > BAAs, account configuration, access controls, logging, encryption, backup/restore and the
@@ -21,8 +22,9 @@ root, so upstream merges stay clean (see [Fork maintenance](#fork-maintenance)).
 | §5.1 Medplum owns chart, encounter status, patient/coverage/provider, signed documentation, FHIR Claim/ClaimResponse, clinical audit/history | Stock Medplum server (resource history kept) + billing `MedplumFhirGateway` | billing `tests/medplum-live` (live) |
 | §6.1 one Medplum project per practice | `src/provisioning` (`provisionPractice`, CLI `src/cli.ts`) | `test/provisioning/*.live.test.ts`, billing `tests/medplum-live` |
 | §6.1 roles Provider / Biller / RCM Supervisor / Practice Admin / Front Office / AI Service + billing integration client, with explicit limitations | `src/policies/roles.ts` (explicit allow lists, no `*`, no deletes) | `test/policies/roles.live.test.ts` |
-| §4, ENC-02 signed content protected from silent edits (incl. biller, AI, integration) | `src/policies/lock.ts` write constraints | `test/policies/lock.live.test.ts`, billing `tests/medplum-live` |
-| AI-03 addendum separately authored/timestamped, original unchanged | lock rules on final `DocumentReference` (`appends` only) + billing `createAddendum` | `lock.live.test.ts`, billing `tests/medplum-live` |
+| §4, ENC-02 signed content protected from silent edits (incl. biller, AI, integration, project admins, policy-less identities) | `src/policies/lock.ts` write constraints **plus** the fork's server guard `packages/server/src/practiceai/` (enabled per project by `Project.systemSetting` `practiceai-signed-lock`) | `packages/server/src/practiceai/*.test.ts`, `test/policies/*.live.test.ts`, billing `tests/medplum-live` |
+| AI-03 addendum separately authored/timestamped, original unchanged | lock rules on final `DocumentReference` (`appends` only) + server guard addendum rule + billing `createAddendum` | `guard.test.ts`, `lock.live.test.ts`, `adversarial.live.test.ts`, billing `tests/medplum-live` |
+| All actions auditable; super admin is break-glass only | server guard: super-admin writes to signed content / `$expunge` / lock-flag changes are allowed but recorded as `AuditEvent` (`purposeOfEvent` BTG) in the practice project + a warn log line | `guard.test.ts`, `bypass.live.test.ts` |
 | AI service reads permitted resources, writes only whitelisted workflow/claim objects | `ai_service` policy (Claim `draft` only, Task/Communication/DetectedIssue) | `roles.live.test.ts` |
 | §12.3 FHIR tests (create/read/version history, references valid through claim versioning) | billing `tests/medplum-live/gateway.test.ts` | live run below |
 | PT clinical content (SOAP Questionnaire, visit types, CPT/HCPCS and ICD-10 value sets) | `src/content` | `test/content` |
@@ -154,6 +156,23 @@ npx vitest run src/fhir/accesspolicy.test.ts -t "Access policy restricting read"
 
 Verified: `src/fhir/accesspolicy.test.ts` passes (70 passed, 4 skipped; single-test filter ~25 s).
 
+Server guard tests (fork-local, `packages/server/src/practiceai/`):
+
+```bash
+bash packages/practiceai/scripts/server-test.sh src/practiceai/             # guard + predicate/parity tests
+bash packages/practiceai/scripts/server-test.sh src/fhir/accesspolicy.test.ts src/fhir/repo.test.ts \
+  src/fhir/operations/expunge.test.ts src/fhir/operations/botinit.test.ts src/fhir/operations/binary-presigned-url.test.ts \
+  src/fhir/binary.test.ts src/storage/ src/admin/ src/fhir/batch.test.ts   # touched upstream areas
+```
+
+Do not run two `server-test.sh` invocations at the same time: they share `medplum_test` and Redis DB 7, and
+the second run's global setup breaks the first (`getSuperAdminTestProject` "Not found").
+
+Last results (2026-09-29, after the Binary / logical-reference fixes): `src/practiceai/` 118 passed (2 files);
+touched upstream areas 439 passed, 4 skipped (14 files). Earlier full sweep (before those fixes): `src/fhir src/admin src/auth src/scim src/oauth src/bots src/workers` 185 files: every file passes
+when run alone except `src/fhir/operations/dbinvalidindexes.test.ts`, which needs a Postgres superuser
+(`UPDATE pg_index`: permission denied for the non-superuser `medplum` role; unrelated to the patch).
+
 ## Package tests
 
 ```bash
@@ -173,8 +192,9 @@ Live suites need a super admin client: `MEDPLUM_ADMIN_CLIENT_ID`/`MEDPLUM_ADMIN_
 `.run/dev-client.json` written by `scripts/smoke.ts`. Each run provisions new synthetic projects
 in the dev database (left in place for inspection).
 
-Last results on the dev server (2026-09-29): offline `npm test` 48 passed / 53 skipped; with
-`MEDPLUM_BASE_URL` 101 passed (11 files); policies live config 38 passed (4 files); `test/e2e` 7 passed.
+Last results on the patched dev server (2026-09-29, server guard incl. Binary / logical-reference fixes, freshly
+rebuilt with `MEDPLUM_BUILD=1`): offline `npm test` 59 passed / 76 skipped; with `MEDPLUM_BASE_URL` 135 passed
+(14 files); policies live config 56 passed (5 files).
 
 ## Practice provisioning (plan §6.1: one Medplum project per practice)
 
@@ -183,7 +203,7 @@ Code: `src/provisioning/` (`provisionPractice`), CLI: `src/cli.ts`. It runs as a
 
 | Resource | Idempotency key (looked up before any write) | Notes |
 | --- | --- | --- |
-| `Project` | `identifier` = `https://practiceai.example/fhir/sid/organization-id` \| billing org UUID | `strictMode: true`. Renaming the practice updates `name`. |
+| `Project` | `identifier` = `https://practiceai.example/fhir/sid/organization-id` \| billing org UUID | `strictMode: true`, `features` ⊇ `transaction-bundles`, `systemSetting` ⊇ `practiceai-signed-lock = true` (turns on the server guard; drift is repaired, other settings kept). Renaming the practice updates `name`. |
 | `Organization` (practice) | same identifier, inside the project | Adds the group NPI (`http://hl7.org/fhir/sid/us-npi`) when given, plus NUCC taxonomy. |
 | `AccessPolicy` x7 | `name:exact` inside the project | From `src/policies` (`buildPracticePolicies`): provider, front_office, biller, rcm_supervisor, practice_admin, ai_service, integration. Drift is overwritten. |
 | `ClientApplication` "PracticeAI Billing Integration" | `name:exact` inside the project | Membership bound to the **integration** policy. This is the billing app's `MEDPLUM_PROJECTS` client. |
@@ -354,17 +374,92 @@ re-linked to another encounter (so a draft cannot be moved into a signed encount
 PUT, JSON Patch, batch and transaction entries, writing `$`-operations, DELETE incl. conditional,
 `_history`, GraphQL mutations, PUT-create at a chosen id, Binary overwrite) by every role identity is
 refused on a signed note, and read side channels (`_revinclude`, `_has`, chaining, `$everything`,
-GraphQL, `$csv`, `_history`) do not leak hidden fields. Open gaps that AccessPolicies cannot close
-(new children attached to a signed encounter, `Project/$init`, hidden-field search oracle, unchecked
-references) are listed with proposals in [`src/policies/README.md`](src/policies/README.md#known-gaps-not-fixable-with-accesspolicies-each-has-a-live-test-asserting-todays-behavior).
+GraphQL, `$csv`, `_history`) do not leak hidden fields. Gaps that AccessPolicies cannot close are closed
+by the server guard below where possible; the rest are listed in
+[`src/policies/README.md`](src/policies/README.md#known-gaps).
 
-**Who bypasses the policies (tested on this build, `test/policies/bypass.live.test.ts`):**
+### Server-side signed-content guard (fork patch, `packages/server/src/practiceai/`)
 
-| Identity | Result |
+AccessPolicies cannot dereference `Procedure.encounter` and are bypassed by project admins and by identities
+without a policy. The fork therefore adds a small guard inside the Medplum server. It is **enabled per project**
+by `Project.systemSetting` `{ name: 'practiceai-signed-lock', valueBoolean: true }` (only a super admin can
+write `systemSetting`: it is a readonly field for project admins upstream and the Project resource is not
+reachable for other members; `guard.test.ts` and `bypass.live.test.ts` verify this). `provisionPractice` and
+`createPracticeProject` set it; a rerun of provisioning repairs a cleared flag.
+
+In an enabled project the guard applies to **every identity except the super admin and the server's internal
+system repository**: project admins, members/clients/bots **without** an AccessPolicy, every role, the
+integration and AI clients. It is evaluated after the AccessPolicy checks, on the stored version, inside the
+repository, so it covers PUT, PATCH, conditional create/update/delete, batch and transaction entries, GraphQL
+mutations and `$`-operations that write through the repository. Refusals are HTTP 403 with
+`issue[0].details.coding = { system: 'https://practiceai.example/fhir/CodeSystem/signed-lock-outcome', code }`:
+
+| Rule | Code |
 | --- | --- |
-| Super admin | Bypasses everything. Operations/provisioning only, never day-to-day traffic. |
-| ClientApplication or membership **without** an AccessPolicy | Full access (legacy `*`). Every client must be created with a policy (provisioning does). |
-| Project admin (`membership.admin = true`), even with a restrictive policy | Ordinary writes obey the policy, but it can (a) `$expunge` a signed note and its history, (b) remove the policy from its own membership and log in again, (c) create an unrestricted ClientApplication. |
+| Update / patch / delete of a **signed** resource (the `lock.ts` predicates: Encounter finished/signature/label, DocumentReference final/amended, QuestionnaireResponse completed/amended, Composition final/amended/attested, labelled Condition/Procedure/Observation/ClinicalImpression). Covers status reversal. | `signed-content-locked` |
+| Update / patch / delete of **any** Condition, Procedure, Observation, ClinicalImpression, QuestionnaireResponse, DocumentReference or Composition that references a signed Encounter of the same project, **labelled or not**; moving a draft child into a signed encounter. "References" means **any element** (not only `encounter` / `context.encounter`: also `focus`, `evidence.detail`, extensions, contained resources, ...) and **both forms**: literal `Encounter/<id>` (relative, absolute, versioned) and logical references (a Reference `identifier` with `type` `Encounter` or no type), which the guard resolves by `Encounter.identifier` within the project (as last committed). The stored and the new version are both checked. | `encounter-signed` |
+| **Create** of any of those types referencing a signed Encounter (same meaning), **except an addendum**: a `DocumentReference` with `docStatus = final`, `author` and `date`, literal encounter links, whose every `relatesTo` is `appends` and targets an existing signed DocumentReference of the same project that belongs to the same encounter | `encounter-signed` |
+| Create / update of any of those types whose `encounter` (`context.encounter` for DocumentReference) link is **not a literal reference**: identifier-only (logical), contained (`#id`), display-only, or a non-Encounter target (`EpisodeOfCare/<id>` is allowed for DocumentReference). Conditional (`Encounter?identifier=...`) and `urn:uuid` references are rewritten to literal ones by the server before the guard runs, so they keep working. A logical reference whose identifier contains search syntax (`|`, `,`, `$`, `\`) or matches 1000+ encounters is treated as signed. | `encounter-reference-invalid` |
+| Update, delete, or `$presigned-url?upload=true` of **any `Binary`** (raw PUT, FHIR PUT/PATCH, batch/transaction, GraphQL). Binaries are write-once in a locked project because attachments (the signed note's body) point at `Binary/<id>` **without a version** and resolve to the latest one; an upload URL would even overwrite the current version's bytes in storage without a new version. Creating new Binaries (e.g. an addendum's content) is unaffected. | `binary-immutable` |
+| `$expunge` (single, `everything=true`, `Project/$expunge`) of anything | `expunge-forbidden` |
+| ProjectMembership create/update (FHIR, `/admin/projects/:id/members/:id`, `/client`, `/bot`, `/invite`, `Bot/$init`, SCIM) without `accessPolicy`/`access` (deactivating with `active: false` is allowed), or with a policy from another project | `membership-policy-required` / `membership-policy-foreign` |
+| Setting `ProjectMembership.admin = true` (invite or update) | `membership-admin-forbidden` |
+| Changing `Project.setting`, `systemSetting`, `systemSecret`, `features`, `checkReferencesOnWrite`, `strictMode`, `superAdmin`, `link`, `defaultAccessPolicies`, `defaultPatientAccessPolicy` (incl. `/admin/projects/:id/settings`), or deleting the Project | `project-settings-locked` |
+| Create / update / delete of `AccessPolicy` (policies are provisioned by the super admin) | `access-policy-super-admin-only` |
+| Update / delete of `AuditEvent` | `audit-immutable` |
+
+- **Encounter state is read as last committed**, on a separate connection, restricted to the same project. So
+  the signing transaction itself (Encounter PUT finished + QuestionnaireResponse PUT completed + note POST, in
+  any order) still works, and every later request sees the encounter as signed. A literal encounter reference
+  that does not resolve in the project (another practice's id, a dangling id) is treated as "not signed" and
+  gives no access to the other project; a logical reference is only resolved within the project, and a
+  non-literal `encounter` link is refused outright (`encounter-reference-invalid`).
+- **Super admin = break-glass.** Its writes are allowed; a write that a member would be refused for signed
+  content, children of a signed encounter, `$expunge`, `AuditEvent`, a `Binary` overwrite/delete/upload URL, or a
+  change of the lock flag itself is
+  logged (`PRACTICEAI break-glass` warn line) and recorded as an `AuditEvent` in the practice project with
+  `purposeOfEvent` `v3-ActReason#BTG`, the entity, and the reason code (saved after commit, so a rolled-back
+  write leaves only the log line). Routine super-admin configuration (provisioning policies, memberships) is
+  not flagged as break-glass.
+- **Unflagged projects are untouched** (upstream behaviour; `guard.test.ts` "unflagged project" and the
+  `bypass.live.test.ts` contrast block).
+- The pure predicates are duplicated in `packages/server/src/practiceai/signed-lock.ts` (the server must not
+  depend on this private package); `signed-lock.test.ts` evaluates the `lock.ts` FHIRPath predicates and
+  encounter link paths on shared fixtures and asserts parity, plus the reason codes in `constants.ts`
+  `SIGNED_LOCK_REASONS` against the guard's `LockReason`. **Change both together.** The guard is deliberately
+  stricter than `lock.ts` in three places that have no FHIRPath equivalent (so they are server-only and not in
+  the parity check): the whole-resource Encounter reference scan, logical-reference resolution, and the
+  literal-link rule; plus the Binary write-once rule.
+
+**Who bypasses the lock now (tested on this build, `test/policies/bypass.live.test.ts`):**
+
+| Identity | Result in a practice (flagged) project |
+| --- | --- |
+| Super admin | Allowed (break-glass), and every write to signed content / `$expunge` / flag change is audited (`AuditEvent` BTG). Operations/provisioning only. |
+| ClientApplication or membership **without** an AccessPolicy | Still full AccessPolicy access to unlocked data (legacy `*`), but refused by the guard for everything above, including overwriting the Binary behind a signed note (`binary-immutable`). The guard refuses creating such memberships unless the caller is the super admin. |
+| Project admin (`membership.admin = true`), with or without a policy | Ordinary writes obey its policy (if any); the former bypasses are refused: (a) `$expunge` → `expunge-forbidden`, (b) removing its own policy → `membership-policy-required`, (c) minting a policy-less client/bot/invite → `membership-policy-required`, plus `admin: true` grants and project settings, (d) overwriting / deleting / getting an upload URL for a signed note's Binary → `binary-immutable`, (e) attaching children by identifier-only reference → `encounter-reference-invalid` / `encounter-signed`. |
+
+**Remaining limitations of the guard (honest list; details in [`src/policies/README.md`](src/policies/README.md#known-gaps)):**
+
+- Only the seven clinical child types are locked through their encounter. Other resources may still reference a
+  signed Encounter (Claim, ChargeItem, Media, DiagnosticReport, ServiceRequest, Task, ...) by design; billing
+  writes Claims after signing.
+- Signed content stored **outside** a Binary of the same project (an attachment `url` to an external server, a
+  `Media` or `DocumentReference` in another resource the note links to) is not protected by the Binary rule. The
+  platform stores note bodies inline (`attachment.data`, locked with the note) or in a project Binary.
+- Binaries are write-once for **every** member in a flagged project, not only the ones a signed note
+  references (a version-less `Binary/<id>` pointer cannot be pinned, and a reverse lookup would miss other
+  attachment-bearing types). Replacing a draft attachment means creating a new Binary and pointing the draft at it.
+- Logical references are resolved by `Encounter.identifier` token search in the same project. A consumer that
+  resolves identifiers differently (e.g. case-insensitive, across projects, or by another element) could
+  link a resource the guard sees as unrelated; references in non-child resource types are not resolved at all.
+- Legacy child resources that already carry a non-literal `encounter` link must be fixed to a literal link
+  before they can be updated in a flagged project (`encounter-reference-invalid`).
+- The signing race (a concurrent transaction committing a child while the signing transaction is in flight) is
+  unchanged; see Known gaps 5.
+- Resources created during the adversarial review on the dev database (identifier-linked Procedures /
+  Observations / a shadow DocumentReference, a forged Binary version) were left in place for inspection; they
+  are synthetic.
 
 So **no day-to-day identity is a project admin or super admin**: `practice_admin` is a normal member
 (`admin: false`), and provisioning never grants `admin: true`.
@@ -374,12 +469,13 @@ runs a `transaction` Bundle with batch semantics (earlier entries commit when a 
 rejected). Both `createPracticeProject` and `provisionPractice` set it (the latter used to omit it; a
 rerun of provisioning now repairs existing projects).
 
-**Known gap (open, verified live):** the billing app's `signEncounter` does not stamp the lock label on
-the encounter's Conditions and Procedures, and a Medplum write constraint cannot dereference
-`Procedure.encounter`. The server therefore lets the integration client rewrite a Procedure of a
-signed encounter (the app's own `assertWritable` still blocks it for traffic through the app). The
-billing live suite shows the gap and verifies the fix (stamp the label in the sign transaction); the
-patch is in billing `docs/medplum/integration.md`.
+**Closed (verified live):** the billing app's `signEncounter` does not stamp the lock label on the
+encounter's Conditions and Procedures; the server guard now locks them anyway (`lock.live.test.ts`
+"CLOSED (server guard)", `provision.live.test.ts`), and refuses new children on the signed encounter
+(`adversarial.live.test.ts` "CLOSED (server guard)"). Billing patch 0001 (stamp the label) remains useful
+defense in depth but is no longer required for the server to hold. The billing repo's own live suite
+(`tests/medplum-live/tamper.test.ts`, owned by the billing team, not run or edited here) still asserts the old
+server behaviour (new Procedure on a signed encounter → 201) and will report that as changed against this build.
 
 ## Live verification of the billing gateway (billing GAP-03)
 
@@ -422,11 +518,14 @@ original; `recordClaimResponse` (linked, searchable by `request`); and `buildSer
 `FHIR_MODE=medplum`.
 
 `tests/medplum-live/tamper.test.ts` (adversarial review) attaches a NEW Procedure/Condition to a signed
-encounter through the raw integration client and provider (the server accepts it: known gap 1 in
-`src/policies/README.md`) and checks that `getBillingContext` refuses to bill it (expected failure until
-billing patch `0003-billing-context-verifies-signed-hash.diff`).
+encounter through the raw integration client and provider and checks that `getBillingContext` refuses to
+bill it (expected failure until billing patch `0003-billing-context-verifies-signed-hash.diff`). **With the
+server guard build, the server now refuses that write (403 `encounter-signed`)**, so this billing test and the
+Condition/Procedure `it.fails` case no longer see the behaviour they were written against; the billing team
+should update them (their repo is not edited from here, and the billing suite was not rerun against the guard
+build).
 
-Last run (2026-09-29, after the adversarial review): **19 passed, 2 expected failures, 2 skipped**. The
+Last run before the server guard (2026-09-29, after the adversarial review): **19 passed, 2 expected failures, 2 skipped**. The
 expected failures (`it.fails`) are the Condition/Procedure lock gap (patch 0001) and the unchecked
 billing context (patch 0003). The 2 skipped are the `buildServices` boot tests in `container.test.ts`:
 the billing app now refuses `AUTH_MODE=demo` with `FHIR_MODE=medplum`, and Supabase auth needs Supabase
@@ -504,19 +603,39 @@ Files that belong to PracticeAI (never in upstream):
 
 - `packages/practiceai/**` (this package; `.run/` and `.env` are gitignored)
 - `docker-compose.practiceai.yml`
+- `packages/server/src/practiceai/**` (server guard: `guard.ts`, `signed-lock.ts`, `guard.test.ts`, `signed-lock.test.ts`)
 
-Upstream files modified: **only `package-lock.json`**, with exactly two added entries for the new
-workspace (`node_modules/@practiceai/medplum-setup` link and `packages/practiceai`, 21 lines). The
-lockfile was restored after `npm install` (the local npm 10 had dropped unrelated `libc` fields) and
-only those entries re-added. No other upstream file is changed; the upstream Dockerfiles, compose
-files, server and app are used as is.
+Upstream files modified:
+
+- `package-lock.json`: exactly two added entries for the new workspace (`node_modules/@practiceai/medplum-setup`
+  link and `packages/practiceai`, 21 lines). The lockfile was restored after `npm install` (the local npm 10
+  had dropped unrelated `libc` fields) and only those entries re-added.
+- 14 added lines in 6 server files, each a single import or a single `await practiceAi...()` call ending in a
+  `// PRACTICEAI:` comment (find them with `git grep -n 'PRACTICEAI:' packages/server/src`), no upstream line
+  changed or removed:
+
+  | File | Line (after patch) | Hook |
+  | --- | --- | --- |
+  | `packages/server/src/fhir/repo.ts` | 74 | import |
+  | `packages/server/src/fhir/repo.ts` | 1082 | `practiceAiGuardWrite(this, existing, result)` in `updateResourceImpl`, after `isResourceWriteable` |
+  | `packages/server/src/fhir/repo.ts` | 1376 | `practiceAiGuardDelete(this, resource)` in `deleteResource`, after the DELETE permission check |
+  | `packages/server/src/fhir/repo.ts` | 1544 | `practiceAiGuardExpunge(this, resourceType, ids)` in `expungeResources` |
+  | `packages/server/src/fhir/operations/expunge.ts` | 19, 42 | import; `practiceAiGuardExpunge` before the async Project/everything job (403 instead of 202) |
+  | `packages/server/src/admin/client.ts` | 11, 43 | import; `practiceAiGuardNewMembership` in `createClient` (membership is written with the system repo) |
+  | `packages/server/src/fhir/operations/botinit.ts` | 20, 97 | import; `practiceAiGuardNewMembership` at the start of `createBot` (`/admin/projects/:id/bot`, `Bot/$init`) |
+  | `packages/server/src/admin/invite.ts` | 42, 454 | import; `practiceAiGuardNewMembership` in `upsertProjectMembership` after defaults (invite, SCIM) |
+  | `packages/server/src/fhir/operations/binary-presigned-url.ts` | 7, 38 | import; `practiceAiGuardBinaryUpload(repo, resource, params.upload)` after the upstream UPDATE check (an upload URL overwrites the Binary's current bytes directly in storage, bypassing the repository) |
+
+The upstream Dockerfiles, compose files and app are used as is (the server image is built from this fork, so it
+contains the guard).
 
 Merging upstream:
 
 ```bash
 git remote add upstream https://github.com/medplum/medplum.git   # once
 git fetch upstream
-git merge upstream/main             # or rebase; conflicts can only be in package-lock.json
+git merge upstream/main             # or rebase; conflicts only in package-lock.json or next to a PRACTICEAI: hook line
+git grep -n 'PRACTICEAI:' packages/server/src   # expect the 14 hook lines listed above; re-add any a merge dropped
 # on a package-lock.json conflict: take upstream's file, then re-add our workspace entries with the
 # npm major upstream uses (npm 10 strips unrelated "libc" fields; revert anything but our 2 entries)
 git checkout --theirs package-lock.json && npm install --package-lock-only
@@ -528,11 +647,15 @@ npx tsx packages/practiceai/scripts/smoke.ts
 bash packages/practiceai/scripts/billing-live-test.sh                                 # billing gateway against the new build
 ```
 
-After every upstream upgrade re-run the live policy suites: they pin behavior this platform relies
-on (AccessPolicy write constraints on `%before`, transaction atomicity with `transaction-bundles`,
-the admin bypasses listed above). `package.json` dependency versions of this package follow the
+After every upstream upgrade re-run the server guard tests (`server-test.sh src/practiceai/`) and the live
+policy suites: they pin behavior this platform relies on (AccessPolicy write constraints on `%before`,
+transaction atomicity with `transaction-bundles`, the guard closing the admin bypasses listed above, and
+`systemSetting` staying super-admin only). If upstream adds a new write path that does not go through
+`Repository.updateResourceImpl` / `deleteResource` / `expungeResources`, or a new route that writes a
+ProjectMembership with the system repository, it needs a hook too. `package.json` dependency versions of this package follow the
 repo's (`@medplum/core` 5.1.42 etc.); bump them with the upstream version.
 
 Lint: the repo's ESLint config requires the Orangebot SPDX header (`header/header`). PracticeAI
 files intentionally do not carry Orangebot's copyright line; add the platform's own header once the
-licensing/branding decision is made.
+licensing/branding decision is made. The server guard files carry `SPDX-License-Identifier: Apache-2.0` and an
+`eslint-disable header/header` comment so `eslint` passes in `packages/server`.

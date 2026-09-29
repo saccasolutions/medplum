@@ -3,7 +3,7 @@ import { inspect } from 'node:util';
 import { describe, expect, test } from 'vitest';
 import { PROVISIONING_SYSTEMS, SYSTEMS, ptContentResources } from '../../src/content';
 import { parseProviderSpec } from '../../src/cli';
-import { PRACTICE_ROLES } from '../../src/policies';
+import { PRACTICE_ROLES, SIGNED_LOCK_PROJECT_SETTING, mergeSystemSettings } from '../../src/policies';
 import {
   AI_SERVICE_CLIENT_NAME,
   INTEGRATION_CLIENT_NAME,
@@ -118,6 +118,22 @@ describe('builders', () => {
     expect(p.identifier).toEqual([{ system: PROVISIONING_SYSTEMS.organizationId, value: ORG }]);
     expect(p.strictMode).toBe(true);
     expect(p.name).toBe('Synthetic PT Clinic');
+  });
+
+  test('project enables the server-side signed-content guard (systemSetting)', () => {
+    expect(buildProject(n).systemSetting).toEqual([{ name: SIGNED_LOCK_PROJECT_SETTING, valueBoolean: true }]);
+    expect(SIGNED_LOCK_PROJECT_SETTING).toBe('practiceai-signed-lock');
+  });
+
+  test('mergeSystemSettings keeps other settings, enforces the lock flag, is idempotent', () => {
+    const other = { name: 'rateLimit', valueInteger: 100 };
+    const flag = { name: SIGNED_LOCK_PROJECT_SETTING, valueBoolean: true };
+    expect(mergeSystemSettings(undefined)).toEqual([flag]);
+    expect(mergeSystemSettings([other])).toEqual([other, flag]);
+    expect(mergeSystemSettings([{ name: SIGNED_LOCK_PROJECT_SETTING, valueBoolean: false }, other])).toEqual([flag, other]);
+    expect(mergeSystemSettings([{ name: SIGNED_LOCK_PROJECT_SETTING, valueString: 'true' }])).toEqual([flag]);
+    const once = mergeSystemSettings([other]);
+    expect(mergeSystemSettings(once)).toEqual(once);
   });
 
   test('organization lives in the project and carries org id + group NPI', () => {
