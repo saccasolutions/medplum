@@ -472,10 +472,9 @@ rerun of provisioning now repairs existing projects).
 **Closed (verified live):** the billing app's `signEncounter` does not stamp the lock label on the
 encounter's Conditions and Procedures; the server guard now locks them anyway (`lock.live.test.ts`
 "CLOSED (server guard)", `provision.live.test.ts`), and refuses new children on the signed encounter
-(`adversarial.live.test.ts` "CLOSED (server guard)"). Billing patch 0001 (stamp the label) remains useful
-defense in depth but is no longer required for the server to hold. The billing repo's own live suite
-(`tests/medplum-live/tamper.test.ts`, owned by the billing team, not run or edited here) still asserts the old
-server behaviour (new Procedure on a signed encounter → 201) and will report that as changed against this build.
+(`adversarial.live.test.ts` "CLOSED (server guard)"). Billing patch 0001 (stamp the label) is applied as
+defense in depth but is no longer required for the server to hold. The billing repo's live suite
+(`tests/medplum-live/tamper.test.ts`) now asserts the guard's refusals; see "Live verification" below.
 
 ## Live verification of the billing gateway (billing GAP-03)
 
@@ -483,7 +482,6 @@ server behaviour (new Procedure on a signed encounter → 201) and will report t
 cd /home/user/medplum
 bash packages/practiceai/scripts/billing-live-test.sh           # fresh synthetic practice per run
 bash packages/practiceai/scripts/billing-live-test.sh --reuse   # reuse .run/e2e-practice.json
-MEDPLUM_LIVE_STRICT=1 bash packages/practiceai/scripts/billing-live-test.sh   # KNOWN-GAP test as a normal (failing) test
 # env: MEDPLUM_BASE_URL (default http://localhost:8103/), BILLING_DIR (default ../billing)
 ```
 
@@ -517,21 +515,22 @@ every reference of v2 (prior Claim, Patient, Coverage, Encounter) still resolves
 original; `recordClaimResponse` (linked, searchable by `request`); and `buildServices` with
 `FHIR_MODE=medplum`.
 
-`tests/medplum-live/tamper.test.ts` (adversarial review) attaches a NEW Procedure/Condition to a signed
-encounter through the raw integration client and provider and checks that `getBillingContext` refuses to
-bill it (expected failure until billing patch `0003-billing-context-verifies-signed-hash.diff`). **With the
-server guard build, the server now refuses that write (403 `encounter-signed`)**, so this billing test and the
-Condition/Procedure `it.fails` case no longer see the behaviour they were written against; the billing team
-should update them (their repo is not edited from here, and the billing suite was not rerun against the guard
-build).
+`tests/medplum-live/tamper.test.ts` asserts the server guard from the billing side: a NEW
+Procedure/Condition/Observation/QuestionnaireResponse, a shadow note or an `Observation.focus` link on a
+signed encounter → 403 `encounter-signed` (integration client and provider); editing an untagged child
+written before signing → `encounter-signed`; identifier-only or display-only encounter links →
+`encounter-reference-invalid`; addenda still allowed. With a policy-less client (created by the super
+admin, skipped if no admin credentials are available) Binary update/delete → `binary-immutable` and a
+signed-Encounter edit → `signed-content-locked`; a super-admin break-glass child is written, and the
+billing app's `getBillingContext` then refuses it with `SignedContentIntegrityError`.
 
-Last run before the server guard (2026-09-29, after the adversarial review): **19 passed, 2 expected failures, 2 skipped**. The
-expected failures (`it.fails`) are the Condition/Procedure lock gap (patch 0001) and the unchecked
-billing context (patch 0003). The 2 skipped are the `buildServices` boot tests in `container.test.ts`:
-the billing app now refuses `AUTH_MODE=demo` with `FHIR_MODE=medplum`, and Supabase auth needs Supabase
-credentials (set `STORE_MODE`/`AUTH_MODE=supabase` and the `SUPABASE` variables to run them); the refusal
-itself is asserted. With patches 0001+0002+0003 applied to a scratch copy of the billing repo: strict live
-run **21 passed, 2 skipped**; full billing unit suite 1611 passed, 23 skipped; `tsc` clean.
+All three billing integration patches (0001 lock label on signing, 0002 seed reuses the provisioned
+directory, 0003 billing context verifies the signed hash) are applied in the billing repo.
+
+Last run against the guard build (2026-09-29): **28 passed, 1 skipped**. The skip is the
+`buildServices` boot test in `container.test.ts`, which needs Supabase credentials (the billing app
+refuses `AUTH_MODE=demo` with `FHIR_MODE=medplum`; set `STORE_MODE`/`AUTH_MODE=supabase` and the
+`SUPABASE` variables to run it).
 
 ## Compose stack (`docker-compose.practiceai.yml`)
 
@@ -577,10 +576,10 @@ docker compose -f docker-compose.practiceai.yml --profile stack down        # ad
   `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` from the host environment; without a
   (synthetic) Supabase project it refuses to start. `SEED_DEMO=false`: the in-app demo seed creates Practitioner
   and Location resources, which the integration policy keeps read-only (verified live by billing
-  `tests/medplum-live/container.test.ts`), so the demo practice is not seeded in this mode yet. Billing
-  patch `docs/medplum/patches/0002-seed-reuses-provisioned-directory.diff` makes the seed reuse the
-  provisioned Practitioner (NPI) and the Location that `provision-e2e.ts` creates as the practice admin;
-  with it applied, set `SEED_DEMO: 'true'` (verified live against the dev server).
+  `tests/medplum-live/container.test.ts`), so the demo practice is not seeded in this mode yet. The billing
+  seed can reuse the provisioned Practitioner (NPI) and the Location that `provision-e2e.ts` creates as
+  the practice admin (`directory: 'reuse'`, selected automatically with `FHIR_MODE=medplum`); set
+  `SEED_DEMO: 'true'` once the service runs with a store mode that supports seeding.
 
 No secret is committed: the compose file carries only the upstream dev defaults (Postgres/Redis
 `medplum`, seeded `admin@example.com` / `medplum_admin`); overrides go in the gitignored
